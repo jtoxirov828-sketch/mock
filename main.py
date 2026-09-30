@@ -10,12 +10,13 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiohttp import web
 
 # .env faylidan maxfiy ma'lumotlarni yuklash
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -360,9 +361,29 @@ def calculate_rasch_model(test_id: int):
         
     return report, final_scores
 
+
+# --- RENDER UCHUN VEB-SERVER QISMI ---
+
+async def handle_ping(request):
+    return web.Response(text="Bot is running in Live mode!")
+
 async def main():
     scheduler.start()
     dp.include_router(router)
+    
+    # Render uchun fake veb-serverni ishga tushirish
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render avtomatik beradigan portni ushlab olish
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    # Botni ishga tushirish (Polling)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
