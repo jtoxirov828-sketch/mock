@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import math
+import pickle
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
@@ -40,11 +41,38 @@ tests_db = {}
 test_counter = 1  
 user_current_test = {} 
 
+# --- MA'LUMOTLARNI SAQLASH VA TIKLASH FUNKSIYALARI ---
+def save_data():
+    try:
+        with open("database.pkl", "wb") as f:
+            pickle.dump({
+                "users_db": users_db,
+                "tests_db": tests_db,
+                "test_counter": test_counter,
+                "user_current_test": user_current_test
+            }, f)
+    except Exception as e:
+        logging.error(f"Saqlashda xatolik: {e}")
+
+def load_data():
+    global test_counter
+    if os.path.exists("database.pkl"):
+        try:
+            with open("database.pkl", "rb") as f:
+                data = pickle.load(f)
+                users_db.update(data.get("users_db", {}))
+                tests_db.update(data.get("tests_db", {}))
+                test_counter = data.get("test_counter", 1)
+                user_current_test.update(data.get("user_current_test", {}))
+        except Exception as e:
+            logging.error(f"Yuklashda xatolik: {e}")
+
 # --- KLAVIATURALAR ---
 def admin_panel_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Yangi mock yaratish", callback_data="new_test")],
-        [InlineKeyboardButton(text="📢 E'lon yuborish", callback_data="send_broadcast")]
+        [InlineKeyboardButton(text="📢 E'lon yuborish", callback_data="send_broadcast")],
+        [InlineKeyboardButton(text="❌ Faol mockni to'xtatish", callback_data="stop_active_mock")]
     ])
 
 def options_keyboard(is_admin=False):
@@ -96,6 +124,12 @@ async def join_test(call: CallbackQuery):
         return
         
     user_id = call.from_user.id
+    
+    if user_id in tests_db[test_id]["results"]:
+        await call.answer("Siz oldin bu testga javob bergansiz", show_alert=True)
+        await bot.send_message(user_id, "Siz oldin bu testga javob bergansiz.")
+        return
+        
     user_current_test[user_id] = test_id
     
     caption = "Mock test boshlandi ishlashingiz mumkin"
@@ -146,6 +180,30 @@ async def receive_user_answer(message: Message):
 async def admin_panel(message: Message):
     if message.from_user.id == ADMIN_ID:
         await message.answer("Admin paneliga xush kelibsiz. Nima qilamiz?", reply_markup=admin_panel_keyboard())
+
+@router.callback_query(F.data == "stop_active_mock")
+async def stop_mock_list(call: CallbackQuery):
+    active_mocks = {tid: t for tid, t in tests_db.items() if t["is_active"]}
+    if not active_mocks:
+        await call.answer("Hozircha faol mocklar yo'q.", show_alert=True)
+        return
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for tid in active_mocks.keys():
+        kb.inline_keyboard.append([InlineKeyboardButton(text=f"❌ Mock #{tid} ni to'xtatish", callback_data=f"force_stop_{tid}")])
+        
+    await call.message.answer("Qaysi mockni muddatidan oldin to'xtatib natijalarni hisoblatmoqchisiz?", reply_markup=kb)
+    await call.answer()
+
+@router.callback_query(F.data.startswith("force_stop_"))
+async def force_stop_mock(call: CallbackQuery):
+    test_id = int(call.data.split("_")[2])
+    
+    if test_id in tests_db and tests_db[test_id]["is_active"]:
+        await call.message.edit_text(f"⏳ Mock #{test_id} muddatidan oldin to'xtatilmoqda...")
+        await finish_test(test_id)
+    else:
+        await call.answer("Bu test allaqachon to'xtatilgan yoki mavjud emas.", show_alert=True)
 
 @router.callback_query(F.data == "new_test")
 async def new_test_start(call: CallbackQuery, state: FSMContext):
@@ -210,19 +268,21 @@ async def get_levels(message: Message, state: FSMContext):
     test_id = test_counter
     duration = data['duration']
     
+    run_time = datetime.now() + timedelta(minutes=duration)
+    
     tests_db[test_id] = {
         "is_active": True,
         "pdf_id": data['pdf_id'],
         "answers": data['answers'],
         "levels": levels,
         "results": {},
-        "user_progress": {}
+        "user_progress": {},
+        "end_time": run_time.timestamp() 
     }
     test_counter += 1
     
     await broadcast_new_test_alert(test_id, duration)
     
-    run_time = datetime.now() + timedelta(minutes=duration)
     scheduler.add_job(finish_test, 'date', run_date=run_time, args=[test_id])
     
     await message.answer(f"✅ Mock Test #{test_id} ishga tushdi va hamma o'quvchilarga xabar berildi.")
@@ -287,10 +347,17 @@ async def finish_test(test_id: int):
         f.write(results_text)
     
     try:
-        await bot.send_document(ADMIN_ID, FSInputFile(filename), caption=f"Test #{test_id} natijalari:")
-        await bot.send_document("@Toxirov_Office_Matematika", FSInputFile(filename), caption=f"📊 Mock Test #{test_id} umumiy natijalari")
+        # Telegram uchun chiroyli ko'rinish (<pre> tegiga o'ralgan holat)
+        table_msg = f"<b>📊 Mock Test #{test_id} Natijalari:</b>\n\n<pre>{results_text}</pre>"
+        
+        if len(table_msg) < 4000:
+            await bot.send_message(ADMIN_ID, table_msg, parse_mode="HTML")
+            await bot.send_message("@Toxirov_Office_Matematika", table_msg, parse_mode="HTML")
+            
+        await bot.send_document(ADMIN_ID, FSInputFile(filename), caption=f"Test #{test_id} fayl shaklidagi natijalari:")
+        await bot.send_document("@Toxirov_Office_Matematika", FSInputFile(filename), caption=f"📊 Mock Test #{test_id} fayl shaklidagi natijalari")
     except Exception as e:
-        await bot.send_message(ADMIN_ID, f"⚠️ Natijalarni kanalga yuborishda xatolik yuz berdi. Bot kanalda admin ekanligini tekshiring! Xato: {e}")
+        await bot.send_message(ADMIN_ID, f"⚠️ Natijalarni yuborishda xatolik yuz berdi. Xato: {e}")
     
     for user_id, data in final_scores.items():
         try:
@@ -353,23 +420,51 @@ def calculate_rasch_model(test_id: int):
         final_scores[uid] = {"score": percent_score, "level": level_name}
 
     sorted_users = sorted(final_scores.items(), key=lambda item: item[1]['score'], reverse=True)
-    report = f"Mock Test #{test_id} Natijalari\nID | Ism Familiya | Ball | Daraja\n" + ("-" * 40) + "\n"
+    
+    # JADVAL YARATISH (Har bir ustunga aniq bo'shliq ajratiladi)
+    report = f"| {'Ism Familiya'.ljust(18)} | {'Ball'.center(5)} | {'Daraja'.center(8)} |\r\n"
+    report += "-" * 42 + "\r\n"
     
     for uid, data in sorted_users:
         name = users_db.get(uid, "Noma'lum")
-        report += f"{uid} | {name} | {data['score']:.1f} | {data['level']}\n"
+        # Ism uzun bo'lsa qisqartiramiz (jadval buzilmasligi uchun)
+        if len(name) > 18:
+            short_name = name[:15] + "..."
+        else:
+            short_name = name.ljust(18)
+            
+        score_str = f"{data['score']:.1f}".center(5)
+        level_str = data['level'].center(8)
+        
+        report += f"| {short_name} | {score_str} | {level_str} |\r\n"
         
     return report, final_scores
 
 
-# --- RENDER UCHUN VEB-SERVER QISMI ---
+# --- RENDER UCHUN VEB-SERVER VA ISHGA TUSHIRISH ---
 
 async def handle_ping(request):
-    return web.Response(text="Bot is running in Live mode!")
+    return web.Response(text="Bot is running in Live mode with Database Protection!")
 
 async def main():
+    # 1. BAZANI YUKLASH (Server o'chgan bo'lsa tiklash)
+    load_data()
+    
     scheduler.start()
     dp.include_router(router)
+    
+    # 2. SERVER O'CHGANDA YO'QOLGAN TAYMERLARNI TIKLASH
+    for tid, t_data in tests_db.items():
+        if t_data.get("is_active"):
+            end_time = datetime.fromtimestamp(t_data["end_time"])
+            if end_time > datetime.now():
+                scheduler.add_job(finish_test, 'date', run_date=end_time, args=[tid])
+            else:
+                # Agar server o'chgan paytda vaqt tugab qolgan bo'lsa, darhol yakunlash
+                asyncio.create_task(finish_test(tid))
+                
+    # 3. HAR 10 SONIYADA BAZANI SAQLASH (Xavfsizlik)
+    scheduler.add_job(save_data, 'interval', seconds=10)
     
     # Render uchun fake veb-serverni ishga tushirish
     app = web.Application()
